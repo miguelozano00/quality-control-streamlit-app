@@ -17,12 +17,21 @@ load_dotenv()
 REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "reports")).expanduser().resolve()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Cargar desde secrets (no aparecen en tu repo público)
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-bucket = st.secrets.get("SUPABASE_BUCKET", "reports")
+# Configuración de Supabase
+SUPABASE_ENABLED = False
+supabase = None
+bucket = "reports"
 
-supabase = create_client(url, key)
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    bucket = st.secrets.get("SUPABASE_BUCKET", "reports")
+    supabase = create_client(url, key)
+    SUPABASE_ENABLED = True
+except Exception:
+    st.warning("⚠️ Supabase no configurado. Se usará solo almacenamiento local.")
+
+
 
 st.set_page_config(page_title="QC Dispositivos", page_icon="✅", layout="wide")
 
@@ -339,7 +348,7 @@ def pagina_consultar():
             st.expander("Vista rápida del contenido").json(resp.json())
 
 def upload_file_to_supabase(local_path: Path, remote_path: str) -> str | None:
-    if not SUPABASE_ENABLED:
+    if not SUPABASE_ENABLED or supabase is None:
         return None
 
     mime, _ = mimetypes.guess_type(str(local_path))
