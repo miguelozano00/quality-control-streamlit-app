@@ -1,5 +1,4 @@
-import os
-import json
+import os, json, mimetypes
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict, field
@@ -11,11 +10,19 @@ from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
+from supabase import create_client
 
 load_dotenv()
 
 REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "reports")).expanduser().resolve()
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Cargar desde secrets (no aparecen en tu repo público)
+url = st.secrets["SUPABASE_URL"]
+key = st.secrets["SUPABASE_KEY"]
+bucket = st.secrets.get("SUPABASE_BUCKET", "reports")
+
+supabase = create_client(url, key)
 
 st.set_page_config(page_title="QC Dispositivos", page_icon="✅", layout="wide")
 
@@ -223,22 +230,78 @@ def pagina_nuevo_informe():
                 destino = Path(nueva_ruta).expanduser().resolve()
                 destino.mkdir(parents=True, exist_ok=True)
                 informe = st.session_state.informe_pendiente
-                _, pdf_path = guardar_informe(informe, base_dir=destino)
+                json_path, pdf_path = guardar_informe(informe, base_dir=destino)
+
+                # Guardado local OK → ahora subimos a Supabase
+                remote_base = f"{informe.identificador}/"
+                json_url = upload_file_to_supabase(json_path, remote_base + json_path.name)
+                pdf_url = upload_file_to_supabase(pdf_path, remote_base + pdf_path.name)
+
                 with open(pdf_path, "rb") as f:
                     st.success(f"Informe guardado en {pdf_path}")
                     st.download_button("Descargar PDF", f.read(), file_name=pdf_path.name, use_container_width=True)
+
+                if pdf_url:
+                    st.link_button("Ver PDF en la nube (Supabase)", pdf_url, use_container_width=True)
+                if json_url:
+                    st.caption(f"Datos subidos a Supabase en {remote_base}")
+
+                # Resetear estado
                 st.session_state.confirmar_guardado = False
                 st.session_state.informe_pendiente = None
             except Exception as e:
                 st.error(f"No se pudo guardar el informe: {e}")
                 st.stop()
 
+def listar_informes_supabase() -> pd.DataFrame:
+    """Lista los informes almacenados en Supabase (archivos .json)."""
+    try:
+        archivos = supabase.storage.from_(bucket).list("", limit=1000)
+        rows = []
+        for obj in archivos:
+            if obj["name"].endswith(".json"):
+                # URL firmada temporal para el JSON
+                json_url = supabase.storage.from_(bucket).create_signed_url(obj["name"], 3600)["signedURL"]
+
+                # Asumimos que el PDF está junto al JSON (mismo prefijo, distinta extensión)
+                pdf_name = obj["name"].replace(".json", ".pdf")
+                try:
+                    pdf_url = supabase.storage.from_(bucket).create_signed_url(pdf_name, 3600)["signedURL"]
+                except Exception:
+                    pdf_url = None
+
+                # Descargar el JSON y parsear contenido
+                import requests
+                resp = requests.get(json_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rows.append({
+                        "identificador": data.get("identificador", ""),
+                        "modelo": data.get("modelo", ""),
+                        "cliente": data.get("cliente", ""),
+                        "fecha_inspeccion": data.get("fecha_inspeccion", ""),
+                        "fecha_fabricacion": data.get("fecha_fabricacion", ""),
+                        "documento": data.get("documento", ""),
+                        "creado_en": data.get("creado_en", ""),
+                        "json_url": json_url,
+                        "pdf_url": pdf_url,
+                    })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values(by="creado_en", ascending=False)
+        return df
+    except Exception as e:
+        st.error(f"No se pudieron listar los informes de Supabase: {e}")
+        return pd.DataFrame()
+
 def pagina_consultar():
-    st.header("Consultar informes")
-    df = cargar_informes()
+    st.header("Consultar informes (Supabase)")
+
+    df = listar_informes_supabase()
     if df.empty:
-        st.info("No hay informes aún.")
+        st.info("No hay informes aún en Supabase.")
         return
+
     buscador = st.text_input("Buscar por identificador/cliente/modelo")
     if buscador:
         mask = (
@@ -247,25 +310,50 @@ def pagina_consultar():
             df.modelo.str.contains(buscador, case=False, na=False)
         )
         df = df[mask]
-    st.dataframe(df[["identificador","cliente","modelo","fecha_inspeccion","creado_en","carpeta"]].reset_index(drop=True), use_container_width=True, hide_index=True)
+
+    st.dataframe(
+        df[["identificador", "cliente", "modelo", "fecha_inspeccion", "creado_en"]].reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
     if not df.empty:
         seleccion = st.selectbox("Selecciona un informe", df["identificador"].tolist())
         fila = df[df["identificador"] == seleccion].iloc[0]
+
         ca, cb = st.columns(2)
         with ca:
-            st.write(f"Carpeta: {fila.carpeta}")
+            st.write(f"Cliente: {fila.cliente}")
+            st.write(f"Modelo: {fila.modelo}")
             st.write(f"Creado: {fila.creado_en}")
         with cb:
-            pdf = Path(fila.pdf)
-            if pdf.exists():
-                with open(pdf, "rb") as f:
-                    st.download_button("Descargar PDF", f.read(), file_name=pdf.name, use_container_width=True)
+            if fila.pdf_url:
+                st.link_button("Abrir PDF en Supabase", fila.pdf_url, use_container_width=True)
             else:
-                st.warning("PDF no encontrado")
-        jf = Path(fila.json)
-        if jf.exists():
-            with jf.open("r", encoding="utf-8") as f:
-                st.expander("Vista rápida del contenido").json(json.load(f))
+                st.warning("No se encontró PDF en Supabase")
+
+        # Vista rápida del JSON
+        import requests
+        resp = requests.get(fila.json_url)
+        if resp.status_code == 200:
+            st.expander("Vista rápida del contenido").json(resp.json())
+
+def upload_file_to_supabase(local_path: Path, remote_path: str) -> str | None:
+    """Sube un archivo al bucket de Supabase. Devuelve URL pública o firmada."""
+    mime, _ = mimetypes.guess_type(str(local_path))
+    with open(local_path, "rb") as f:
+        supabase.storage.from_(bucket).upload(
+            path=remote_path,
+            file=f,
+            file_options={"content-type": mime or "application/octet-stream", "upsert": True},
+        )
+    try:
+        # Si el bucket es público
+        return supabase.storage.from_(bucket).get_public_url(remote_path)
+    except Exception:
+        # Si es privado, generamos un enlace firmado
+        res = supabase.storage.from_(bucket).create_signed_url(remote_path, 3600)
+        return res.get("signedURL")
 
 def main():
     st.sidebar.title("Menú")
