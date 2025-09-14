@@ -339,19 +339,28 @@ def pagina_consultar():
             st.expander("Vista rápida del contenido").json(resp.json())
 
 def upload_file_to_supabase(local_path: Path, remote_path: str) -> str | None:
-    """Sube un archivo al bucket de Supabase. Devuelve URL pública o firmada."""
+    if not SUPABASE_ENABLED:
+        return None
+
     mime, _ = mimetypes.guess_type(str(local_path))
+    opts = {
+        "content-type": mime or "application/octet-stream",
+        "x-upsert": "true",        # <- en texto, no bool
+        "cache-control": "3600",   # <- en texto
+    }
+
     with open(local_path, "rb") as f:
+        # según versión del SDK, cualquiera de estas dos firmas funciona
         supabase.storage.from_(bucket).upload(
             path=remote_path,
             file=f,
-            file_options={"content-type": mime or "application/octet-stream", "upsert": True},
+            file_options=opts,
         )
+
+    # si el bucket es público devuelve URL pública; si es privado, firmada
     try:
-        # Si el bucket es público
         return supabase.storage.from_(bucket).get_public_url(remote_path)
     except Exception:
-        # Si es privado, generamos un enlace firmado
         res = supabase.storage.from_(bucket).create_signed_url(remote_path, 3600)
         return res.get("signedURL")
 
